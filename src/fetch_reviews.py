@@ -1,4 +1,4 @@
-"""Download English Steam reviews for Delta Force.
+"""Download Steam reviews for Delta Force and Battlefield 6.
 
 Design
 ------
@@ -9,11 +9,13 @@ Design
 
 Both modes append to the same ``data/raw/reviews_raw.jsonl`` file in an
 API-like shape, so ``clean_reviews.py`` does not need to care where the data
-came from.  Every page is checkpointed in ``data/state/crawl_state.json``;
+came from. Every page is checkpointed in a per-game state file;
 rerunning the script resumes from the last saved position.
 
 Usage (from the project root):
-    python src/fetch_reviews.py                 # auto: API, then HTML fallback
+    python src/fetch_reviews.py                 # scrape both games, resume each
+    python src/fetch_reviews.py --game delta-force
+    python src/fetch_reviews.py --game battlefield-6
     python src/fetch_reviews.py --mode api
     python src/fetch_reviews.py --mode html
     python src/fetch_reviews.py --max-pages 3   # quick smoke test
@@ -75,6 +77,7 @@ def default_state() -> dict[str, Any]:
         "app_id": config.APP_ID,
         "app_name": config.APP_NAME,
         "language": config.LANGUAGE,
+        "api_version": config.API_VERSION,
         "mode": None,
         "cursor": "*",
         "next_params": None,
@@ -90,6 +93,9 @@ def default_state() -> dict[str, Any]:
 def load_state() -> dict[str, Any]:
     state = default_state()
     saved = load_json(config.STATE_PATH, default={})
+    # Migrate the original Delta Force checkpoint transparently.
+    if not saved and config.APP_ID == 2507950:
+        saved = load_json(config.STATE_DIR / "crawl_state.json", default={})
     if isinstance(saved, dict):
         state.update(saved)
     if state.get("app_id") != config.APP_ID:
@@ -100,6 +106,25 @@ def load_state() -> dict[str, Any]:
             config.APP_ID,
         )
         state = default_state()
+    elif state.get("language") != config.LANGUAGE:
+        LOGGER.info(
+            "Review language changed from %s to %s; restarting this game's cursor. "
+            "Existing IDs will still be skipped.",
+            state.get("language"),
+            config.LANGUAGE,
+        )
+        state = default_state()
+    elif state.get("mode") == "api" and state.get("api_version") != config.API_VERSION:
+        LOGGER.info(
+            "Steam review API changed; restarting the cursor for %s. "
+            "Previously saved review IDs will be skipped.",
+            config.APP_NAME,
+        )
+        state["cursor"] = "*"
+        state["pages_done"] = 0
+        state["finished"] = False
+        state["query_summary"] = {}
+        state["api_version"] = config.API_VERSION
     if not state.get("started_at"):
         state["started_at"] = utc_now_iso()
     return state
@@ -124,6 +149,8 @@ def append_raw(records: list[dict[str, Any]], source: str) -> int:
         for record in records:
             record = dict(record)
             record["_source"] = source
+            record["_app_id"] = config.APP_ID
+            record["_app_name"] = config.APP_NAME
             record["_scraped_at"] = scraped_at
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
@@ -147,7 +174,8 @@ def load_seen_ids() -> set[str]:
                 skipped += 1
                 continue
             review_id = record.get("recommendationid") or record.get("_html_key")
-            if review_id:
+            app_id = record.get("_app_id", record.get("app_id", config.APP_ID))
+            if review_id and str(app_id) == str(config.APP_ID):
                 seen.add(str(review_id))
 
     if skipped:
@@ -161,12 +189,12 @@ def load_seen_ids() -> set[str]:
 # ---------------------------------------------------------------------------
 def api_params(cursor: str, num_per_page: int = config.PAGE_SIZE) -> dict[str, Any]:
     return {
-        "json": 1,
-        "language": config.LANGUAGE,
-        "filter": "recent",          # complete chronological crawl
-        "review_type": "all",        # positive + negative
-        "purchase_type": "all",      # Steam + non-Steam purchases
-        "filter_offtopic_activity": 0,
+        "appid": config.APP_ID,
+        "filter": 1,                  # k_EUserReviewsAppReviewsFilter_Recent
+        "languages": [config.LANGUAGE],
+        "review_type": 0,            # k_EUserReviewsReviewType_All
+        "purchase_type": 1,          # k_EUserReviewsPurchaseType_All
+        "filter_offtopic_activity": False,
         "num_per_page": num_per_page,
         "cursor": cursor,
     }
@@ -185,7 +213,10 @@ def fetch_api_page(
         ApiBlockedError: Steam redirected or served HTML instead of JSON.
         ApiError: retries exhausted or an unexpected HTTP status.
     """
-    params = api_params(cursor, num_per_page)
+    input_json = json.dumps(api_params(cursor, num_per_page), separators=(",", ":"))
+    params: dict[str, Any] = {"input_json": input_json}
+    if config.API_KEY:
+        params["key"] = config.API_KEY
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -215,7 +246,15 @@ def fetch_api_page(
             wait = int(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
             wait = min(wait, 120)
             if attempt >= max_retries:
-                raise ApiError(f"HTTP {response.status_code} after {attempt} attempts")
+                detail = (
+                    ". Set STEAM_API_KEY to an app-associated publisher key for a higher rate limit"
+                    if response.status_code == 429
+                    else ""
+                )
+                raise ApiError(
+                    f"Steam GetAppReviews returned HTTP {response.status_code} "
+                    f"after {attempt} attempts{detail}"
+                )
             LOGGER.warning(
                 "API returned HTTP %s. Retrying in %ss (attempt %s/%s)...",
                 response.status_code,
@@ -227,7 +266,12 @@ def fetch_api_page(
             continue
 
         if response.status_code != 200:
-            raise ApiError(f"Unexpected HTTP {response.status_code} from review API")
+            detail = ""
+            if response.status_code in (401, 403):
+                detail = ". Check STEAM_API_KEY and that the key is associated with this app"
+            raise ApiError(
+                f"Steam GetAppReviews returned HTTP {response.status_code}{detail}"
+            )
 
         content_type = response.headers.get("content-type", "").lower()
         body = response.text.lstrip()
@@ -241,10 +285,18 @@ def fetch_api_page(
         except ValueError as exc:
             raise ApiBlockedError("Review API response was not valid JSON.") from exc
 
-        if data.get("success") != 1:
-            raise ApiError(f"Review API returned success={data.get('success')!r}")
-
-        return data
+        # Steam Web API service methods normally wrap results in `response`;
+        # accept an unwrapped body as well for forward compatibility.
+        payload = data.get("response", data)
+        if not isinstance(payload, dict):
+            raise ApiError("GetAppReviews response did not contain a JSON object")
+        if "reviews" not in payload:
+            api_error = data.get("error") or payload.get("error")
+            raise ApiError(
+                "GetAppReviews response did not include a reviews list"
+                + (f": {api_error}" if api_error else "")
+            )
+        return payload
 
     raise ApiError("Retries exhausted while calling the review API")
 
@@ -467,7 +519,7 @@ def parse_html_card(card: Any, reference: Any) -> dict[str, Any] | None:
             "playtime_forever": int(round(playtime_hours * 60)) if playtime_hours else None,
             "playtime_at_review": None,
         },
-        "language": config.LANGUAGE,
+        "language": config.LANGUAGE if config.LANGUAGE != "all" else "unknown",
         "review": review_text,
         "voted_up": voted_up,
         "votes_up": votes_up,
@@ -597,12 +649,18 @@ def api_available(session: requests.Session) -> bool:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scrape English Delta Force reviews from Steam.")
+    parser = argparse.ArgumentParser(description="Scrape Steam reviews for supported games.")
     parser.add_argument(
         "--mode",
         choices=("auto", "api", "html"),
         default="auto",
         help="api = JSON endpoint, html = community pages, auto = try API then fall back.",
+    )
+    parser.add_argument(
+        "--game",
+        choices=("all", *config.GAMES.keys()),
+        default="all",
+        help="Which game to crawl (default: all; each game has a separate checkpoint).",
     )
     parser.add_argument(
         "--max-pages",
@@ -613,7 +671,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reset-state",
         action="store_true",
-        help="Delete data/state/crawl_state.json and start from page 1. Raw data is kept.",
+        help="Delete the selected game's checkpoint(s) and start from page 1. Raw data is kept.",
     )
     return parser.parse_args(argv)
 
@@ -621,73 +679,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     config.ensure_directories()
+    games = list(config.GAMES) if args.game == "all" else [args.game]
+    for game in games:
+        config.select_game(game)
+        if args.reset_state and config.STATE_PATH.exists():
+            config.STATE_PATH.unlink()
+            LOGGER.info("Deleted checkpoint for %s.", config.APP_NAME)
 
-    if args.reset_state and config.STATE_PATH.exists():
-        config.STATE_PATH.unlink()
-        LOGGER.info("State file deleted; a new crawl will start from the beginning.")
+        state = load_state()
+        if state.get("finished"):
+            LOGGER.info("%s is already complete (%s saved).", config.APP_NAME,
+                        state.get("reviews_saved"))
+            continue
 
-    state = load_state()
-    if state.get("finished"):
-        LOGGER.info(
-            "Crawl is already marked finished (%s reviews in %s pages). "
-            "Use --reset-state to crawl again.",
-            state.get("reviews_saved"),
-            state.get("pages_done"),
-        )
-        return 0
+        session = requests.Session()
+        session.headers.update(config.request_headers())
+        mode = args.mode
+        if mode == "auto":
+            mode = state.get("mode") if state.get("mode") in {"api", "html"} else None
+            if mode is None:
+                mode = "api" if api_available(session) else "html"
+                LOGGER.info("Selected mode for %s: %s", config.APP_NAME, mode.upper())
 
-    session = requests.Session()
-    session.headers.update(config.request_headers())
-
-    mode = args.mode
-    if mode == "auto":
-        mode = state.get("mode") if state.get("mode") in {"api", "html"} else None
-        if mode is None:
-            mode = "api" if api_available(session) else "html"
-            LOGGER.info("Selected mode: %s", mode.upper())
-
-    state["mode"] = mode
-    save_state(state)
-
-    LOGGER.info(
-        "Starting %s crawl for app %s (%s), language=%s, saved so far=%s",
-        mode.upper(),
-        config.APP_ID,
-        config.APP_NAME,
-        config.LANGUAGE,
-        state.get("reviews_saved", 0),
-    )
-
-    seen = load_seen_ids()
-
-    try:
-        if mode == "api":
-            crawl_api(session, state, max_pages=args.max_pages, seen=seen)
-        else:
-            crawl_html(session, state, max_pages=args.max_pages, seen=seen)
-    except ApiBlockedError as exc:
-        LOGGER.error("API blocked and no fallback was attempted: %s", exc)
-        LOGGER.error(
-            "Rerun with: python src/fetch_reviews.py --mode html --reset-state"
-        )
+        state["mode"] = mode
+        state["api_version"] = config.API_VERSION if mode == "api" else None
         save_state(state)
-        return 2
-    except ApiError as exc:
-        LOGGER.error("Crawl stopped by an unrecoverable error: %s", exc)
-        LOGGER.error("Progress is saved. Rerun the same command to resume.")
-        save_state(state)
-        return 1
-    except KeyboardInterrupt:
-        LOGGER.warning("Interrupted by user. Progress has been saved; rerun to resume.")
-        save_state(state)
-        return 130
-
-    LOGGER.info(
-        "Done. Mode=%s | pages=%s | reviews saved=%s",
-        mode,
-        state.get("pages_done"),
-        state.get("reviews_saved"),
-    )
+        LOGGER.info("Starting %s crawl for %s (App ID %s); saved so far=%s",
+                    mode.upper(), config.APP_NAME, config.APP_ID, state.get("reviews_saved", 0))
+        seen = load_seen_ids()
+        try:
+            if mode == "api":
+                crawl_api(session, state, max_pages=args.max_pages, seen=seen)
+            else:
+                crawl_html(session, state, max_pages=args.max_pages, seen=seen)
+        except ApiBlockedError as exc:
+            LOGGER.error("API blocked for %s and no fallback was attempted: %s", config.APP_NAME, exc)
+            LOGGER.error("Rerun with: python src/fetch_reviews.py --game %s --mode html", game)
+            save_state(state)
+            return 2
+        except ApiError as exc:
+            LOGGER.error("Crawl stopped for %s: %s. Progress is saved; rerun to resume.", config.APP_NAME, exc)
+            save_state(state)
+            return 1
+        except KeyboardInterrupt:
+            LOGGER.warning("Interrupted. Progress for %s has been saved; rerun to resume.", config.APP_NAME)
+            save_state(state)
+            return 130
+        LOGGER.info("Done: %s | mode=%s | pages=%s | reviews saved=%s",
+                    config.APP_NAME, mode, state.get("pages_done"), state.get("reviews_saved"))
     return 0
 
 

@@ -1,4 +1,4 @@
-"""Validate the cleaned Delta Force review dataset.
+"""Validate the cleaned Delta Force and Battlefield 6 review dataset.
 
 Usage:
     python src/validate_reviews.py
@@ -25,7 +25,10 @@ from common import load_json, setup_logging  # noqa: E402
 
 LOGGER = setup_logging()
 
-RELEASE_DATE = datetime(2024, 12, 4, tzinfo=timezone.utc)
+RELEASE_DATES = {
+    2507950: datetime(2024, 12, 4, tzinfo=timezone.utc),
+    2807960: datetime(2025, 10, 10, tzinfo=timezone.utc),
+}
 
 
 class Report:
@@ -60,7 +63,7 @@ def main() -> int:
     csv_path = config.CLEAN_CSV_PATH
     report = Report()
 
-    report.lines.append("Delta Force English Reviews — Validation Summary")
+    report.lines.append("Delta Force + Battlefield 6 English Reviews — Validation Summary")
     report.lines.append("=" * 52)
     report.lines.append(f"Run at (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     report.lines.append(f"Dataset     : {csv_path}")
@@ -83,22 +86,20 @@ def main() -> int:
         return finish(report)
 
     report.section("Uniqueness & language")
-    unique_ids = dataframe["review_id"].nunique(dropna=True)
+    unique_ids = dataframe[["app_id", "review_id"]].drop_duplicates().shape[0]
     report.check(
         unique_ids == len(dataframe),
-        "review_id is unique",
+        "(app_id, review_id) is unique",
         f"{unique_ids} unique / {len(dataframe)} rows",
     )
 
     language_counts = dataframe["language"].fillna("").str.lower().value_counts().to_dict()
-    report.check(
-        set(language_counts) == {"english"},
-        "All rows are English",
-        str(language_counts),
-    )
+    report.check(bool(language_counts) and all(language_counts),
+                 "Review language is recorded", str(language_counts))
 
     app_ids = sorted(dataframe["app_id"].dropna().unique().tolist())
-    report.check(app_ids == [config.APP_ID], "All rows belong to the expected app", str(app_ids))
+    expected_app_ids = sorted(app_id for app_id, _ in config.GAMES.values())
+    report.check(set(app_ids).issubset(set(expected_app_ids)), "Rows belong to supported apps", str(app_ids))
 
     report.section("Required fields")
     for column in ("review_id", "voted_up", "created_at_utc", "review_text", "review_clean"):
@@ -129,7 +130,8 @@ def main() -> int:
     )
 
     future_limit = datetime.now(timezone.utc).replace(microsecond=0)
-    too_early = int((parsed_dates < RELEASE_DATE).sum())
+    release_limits = dataframe["app_id"].map(RELEASE_DATES)
+    too_early = int((parsed_dates < release_limits).fillna(False).sum())
     too_late = int((parsed_dates > future_limit).sum())
     report.check(too_early == 0, "No reviews before the game's release", f"{too_early} rows")
     report.check(too_late == 0, "No reviews dated in the future", f"{too_late} rows")
@@ -140,7 +142,7 @@ def main() -> int:
 
     report.section("Duplicates")
     duplicate_text = int(
-        dataframe.duplicated(subset=["author_id_hash", "review_clean"], keep="first").sum()
+        dataframe.duplicated(subset=["app_id", "author_id_hash", "review_clean"], keep="first").sum()
     )
     report.check(duplicate_text == 0, "No duplicate author+text pairs", f"{duplicate_text} duplicates", critical=False)
 
@@ -154,25 +156,18 @@ def main() -> int:
     sources = dataframe["source"].fillna("unknown").value_counts().to_dict()
     report.info("Sources", sources)
 
-    state = load_json(config.STATE_PATH, default={})
-    api_summary = load_json(config.API_SUMMARY_PATH, default={})
-    mode = state.get("mode") if isinstance(state, dict) else None
-    total_reviews = int(api_summary.get("total_reviews") or 0) if isinstance(api_summary, dict) else 0
-
-    if mode == "api" and total_reviews:
-        difference = abs(len(dataframe) - total_reviews) / total_reviews
-        report.check(
-            difference <= 0.02,
-            "Row count matches Steam query_summary.total_reviews (within 2%)",
-            f"dataset={len(dataframe)}, Steam={total_reviews}, diff={difference:.2%}",
-            critical=False,
-        )
-    else:
-        report.info(
-            "API total",
-            "not available (HTML fallback or no query_summary saved); "
-            "completeness is bounded by the last crawl page",
-        )
+    for app_id, app_name in config.GAMES.values():
+        state = load_json(config.STATE_DIR / f"crawl_state_{app_id}.json", default={})
+        api_summary = load_json(config.STATE_DIR / f"api_summary_{app_id}.json", default={})
+        mode = state.get("mode") if isinstance(state, dict) else None
+        total_reviews = int(api_summary.get("total_reviews") or 0) if isinstance(api_summary, dict) else 0
+        count = int((dataframe["app_id"] == app_id).sum())
+        if mode == "api" and total_reviews:
+            difference = abs(count - total_reviews) / total_reviews
+            report.check(difference <= 0.02, f"{app_name} count matches Steam total (within 2%)",
+                         f"dataset={count}, Steam={total_reviews}, diff={difference:.2%}", critical=False)
+        else:
+            report.info(f"{app_name} API total", "not available (HTML fallback or no query_summary)")
 
     report.section("Optional language detection")
     guesses = dataframe["lang_guess"].fillna("").str.strip()

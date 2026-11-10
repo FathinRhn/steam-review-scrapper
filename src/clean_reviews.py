@@ -7,7 +7,7 @@ Run after ``fetch_reviews.py``:
 
 Outputs
 -------
-data/processed/delta_force_reviews_english.csv
+data/processed/steam_reviews_all_languages.csv
 reports/data_dictionary.md
 reports/cleaning_summary.txt
 """
@@ -66,15 +66,15 @@ COLUMNS = [
     "source",
 ]
 
-DATA_DICTIONARY = """# Data Dictionary — Delta Force English Steam Reviews
+DATA_DICTIONARY = """# Data Dictionary — Delta Force and Battlefield 6 English Steam Reviews
 
-One row per English review of *Delta Force* (Steam app **2507950**).
+One row per English review of *Delta Force* (Steam app **2507950**) or *Battlefield 6* (Steam app **2807960**).
 
 | Column | Type | Description |
 |---|---|---|
-| `review_id` | string | Steam `recommendationid` (API mode) or a deterministic `html-...` surrogate key (HTML fallback). Unique per row. |
-| `app_id` | integer | Steam application ID (2507950). |
-| `language` | string | Review language reported by Steam, or the language filter used in HTML mode. Always `english` in this dataset. |
+| `review_id` | string | Steam `recommendationid` (API mode) or deterministic `html-...` key (HTML fallback). Unique within each app. |
+| `app_id` | integer | Steam application ID (2507950 = Delta Force; 2807960 = Battlefield 6). |
+| `language` | string | Review language reported by Steam. HTML fallback uses `unknown` when the page does not expose it. |
 | `review_text` | string | Original review text, untouched (may contain BBCode/HTML). |
 | `review_clean` | string | Review text with BBCode/HTML stripped and whitespace normalised. Use this for NLP. |
 | `voted_up` | boolean | `True` = Recommended, `False` = Not Recommended. |
@@ -189,8 +189,8 @@ def build_row(record: dict[str, Any], reference: datetime) -> dict[str, Any] | N
 
     return {
         "review_id": str(review_id),
-        "app_id": config.APP_ID,
-        "language": (record.get("language") or "").strip().lower(),
+        "app_id": int(record.get("_app_id", record.get("app_id", config.APP_ID))),
+        "language": (record.get("language") or "unknown").strip().lower(),
         "review_text": review_text,
         "review_clean": review_clean,
         "voted_up": safe_bool(record.get("voted_up")),
@@ -252,7 +252,7 @@ def write_summary(
     languages = dataframe["lang_guess"].replace("", pd.NA).dropna().value_counts().head(10).to_dict()
 
     lines = [
-        "Delta Force English Review — Cleaning Summary",
+        "Delta Force + Battlefield 6 English Review — Cleaning Summary",
         "=" * 46,
         f"Run at (UTC)              : {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
         f"Raw records read          : {raw_count}",
@@ -260,7 +260,7 @@ def write_summary(
         f"Dropped (missing ID)      : {missing_id}",
         f"Duplicate review IDs      : {duplicate_ids}",
         f"Duplicate author+text     : {duplicate_authors}",
-        f"Dropped (non-English)     : {non_english}",
+        f"Dropped (language filter)  : {non_english}",
         f"Dropped (text < 3 chars)  : {too_short}",
         f"Final rows                : {final_count}",
         "",
@@ -277,7 +277,7 @@ def write_summary(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Clean raw Delta Force reviews into a CSV.")
+    parser = argparse.ArgumentParser(description="Clean raw Delta Force and Battlefield 6 reviews into a CSV.")
     parser.add_argument("--input", type=Path, default=config.RAW_PATH)
     parser.add_argument("--output", type=Path, default=config.CLEAN_CSV_PATH)
     parser.add_argument(
@@ -316,20 +316,18 @@ def main(argv: list[str] | None = None) -> int:
     if "scraped_at_utc" in dataframe.columns:
         dataframe = dataframe.sort_values("scraped_at_utc", na_position="first")
     before = len(dataframe)
-    dataframe = dataframe.drop_duplicates(subset=["review_id"], keep="last")
+    dataframe = dataframe.drop_duplicates(subset=["app_id", "review_id"], keep="last")
     duplicate_ids = before - len(dataframe)
 
     # 2. Deduplicate identical text by the same author (copy-paste spam guard).
     duplicate_author_mask = dataframe.duplicated(
-        subset=["author_id_hash", "review_clean"], keep="first"
+        subset=["app_id", "author_id_hash", "review_clean"], keep="first"
     ) & dataframe["author_id_hash"].notna()
     duplicate_authors = int(duplicate_author_mask.sum())
     dataframe = dataframe[~duplicate_author_mask]
 
-    # 3. Defensive English-only filter.
-    language_normalised = dataframe["language"].fillna("").str.strip().str.lower()
-    non_english = int((language_normalised != "english").sum())
-    dataframe = dataframe[language_normalised == "english"].copy()
+    # 3. Keep every language; Steam's API reports the language per review.
+    non_english = 0
 
     # 4. Drop empty one-word noise rows.
     too_short_mask = dataframe["review_clean"].str.len() < 3

@@ -10,6 +10,7 @@ short report.  No data is written.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -60,24 +61,27 @@ def main() -> int:
         print("[WARN] Expected a 2024 release date.")
 
     try:
+        input_json = {
+            "appid": config.APP_ID,
+            "filter": 1,
+            "languages": [config.LANGUAGE],
+            "review_type": 0,
+            "purchase_type": 1,
+            "num_per_page": 1,
+            "cursor": "*",
+        }
+        params = {"input_json": json.dumps(input_json, separators=(",", ":"))}
+        if config.API_KEY:
+            params["key"] = config.API_KEY
         probe = session.get(
             config.API_URL,
-            params={
-                "json": 1,
-                "language": config.LANGUAGE,
-                "filter": "recent",
-                "review_type": "all",
-                "purchase_type": "all",
-                "num_per_page": 1,
-                "cursor": "*",
-            },
+            params=params,
             timeout=config.REQUEST_TIMEOUT,
-            allow_redirects=False,
         )
-        if probe.is_redirect or probe.status_code != 200:
+        if probe.status_code != 200:
             print(
                 f"[WARN] Review API not reachable from this network "
-                f"(HTTP {probe.status_code}). fetch_reviews.py will use the HTML fallback."
+                f"(HTTP {probe.status_code}). fetch_reviews.py may use the HTML fallback."
             )
         else:
             try:
@@ -85,10 +89,11 @@ def main() -> int:
             except ValueError:
                 print("[WARN] Review API returned non-JSON content; HTML fallback will be used.")
             else:
+                body = body.get("response", body)
                 summary = body.get("query_summary", {})
-                print(f"  API OK      : success={body.get('success')}")
+                print("  API OK      : GetAppReviews responded successfully")
                 print(
-                    "  English total: "
+                    "  Review total: "
                     f"{summary.get('total_reviews')} reviews "
                     f"({summary.get('total_positive')} positive / "
                     f"{summary.get('total_negative')} negative)"

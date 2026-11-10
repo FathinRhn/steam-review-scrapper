@@ -1,4 +1,4 @@
-"""Central configuration for the Delta Force Steam review scraper.
+"""Central configuration for the supported Steam review crawls.
 
 All tunable values live here so the rest of the code stays simple.  Values can
 be overridden with environment variables without editing this file.
@@ -12,15 +12,23 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Game / endpoint settings
 # ---------------------------------------------------------------------------
-APP_ID = int(os.getenv("STEAM_APP_ID", "2507950"))
-APP_NAME = "Delta Force"
+GAMES = {
+    "delta-force": (2507950, "Delta Force"),
+    "battlefield-6": (2807960, "Battlefield 6"),
+}
+DEFAULT_GAME = os.getenv("STEAM_GAME", "delta-force")
+APP_ID = int(os.getenv("STEAM_APP_ID", str(GAMES[DEFAULT_GAME][0])))
+APP_NAME = GAMES.get(DEFAULT_GAME, (APP_ID, "Steam game"))[1]
 APP_URL = f"https://store.steampowered.com/app/{APP_ID}/"
 
-# Steam language code.  "english" is the only accepted value for this project.
-LANGUAGE = os.getenv("REVIEW_LANGUAGE", "english")
+# "all" collects reviews in every language; set REVIEW_LANGUAGE to limit it.
+LANGUAGE = os.getenv("REVIEW_LANGUAGE", "all")
 
-# Public review endpoints (no API key required).
-API_URL = f"https://store.steampowered.com/appreviews/{APP_ID}"
+# Current Steamworks reviews endpoint. A key is optional; an app-associated
+# publisher key receives a higher rate limit. Never commit the key to source.
+API_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
+API_KEY = os.getenv("STEAM_API_KEY", "").strip()
+API_VERSION = 2
 HTML_REVIEWS_URL = f"https://steamcommunity.com/app/{APP_ID}/reviews/"
 HTML_MORE_URL = f"https://steamcommunity.com/app/{APP_ID}/homecontent/"
 
@@ -60,14 +68,27 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 REPORT_DIR = PROJECT_ROOT / "reports"
 
 RAW_PATH = RAW_DIR / "reviews_raw.jsonl"
-STATE_PATH = STATE_DIR / "crawl_state.json"
-API_SUMMARY_PATH = STATE_DIR / "api_summary.json"
+STATE_PATH = STATE_DIR / f"crawl_state_{APP_ID}.json"
+API_SUMMARY_PATH = STATE_DIR / f"api_summary_{APP_ID}.json"
 
-CLEAN_CSV_PATH = PROCESSED_DIR / "delta_force_reviews_english.csv"
+CLEAN_CSV_PATH = PROCESSED_DIR / "steam_reviews_all_languages.csv"
 LOG_PATH = REPORT_DIR / "scrape_log.txt"
 DATA_DICTIONARY_PATH = REPORT_DIR / "data_dictionary.md"
 VALIDATION_PATH = REPORT_DIR / "validation_summary.txt"
 CLEANING_SUMMARY_PATH = REPORT_DIR / "cleaning_summary.txt"
+
+
+def select_game(game: str) -> None:
+    """Set endpoint and checkpoint paths for one configured game."""
+    global APP_ID, APP_NAME, APP_URL, API_URL, HTML_REVIEWS_URL, HTML_MORE_URL
+    global STATE_PATH, API_SUMMARY_PATH
+    APP_ID, APP_NAME = GAMES[game]
+    APP_URL = f"https://store.steampowered.com/app/{APP_ID}/"
+    API_URL = "https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/"
+    HTML_REVIEWS_URL = f"https://steamcommunity.com/app/{APP_ID}/reviews/"
+    HTML_MORE_URL = f"https://steamcommunity.com/app/{APP_ID}/homecontent/"
+    STATE_PATH = STATE_DIR / f"crawl_state_{APP_ID}.json"
+    API_SUMMARY_PATH = STATE_DIR / f"api_summary_{APP_ID}.json"
 
 
 def ensure_directories() -> None:

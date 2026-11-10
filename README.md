@@ -15,9 +15,9 @@ on its own.
 | File | Contents |
 |---|---|
 | `data/raw/reviews_raw.jsonl` | Append-only raw crawl, one API-shaped review object per line. |
-| `data/state/crawl_state.json` | Cursor / page / progress checkpoint. Makes the crawl resumable. |
-| `data/state/api_summary.json` | Steam's `query_summary` totals (API mode), used for validation. |
-| `data/processed/delta_force_reviews_english.csv` | Clean, deduplicated, English-only dataset. |
+| `data/state/crawl_state_<app_id>.json` | Separate cursor / progress checkpoint for each game. |
+| `data/state/api_summary_<app_id>.json` | Steam's per-game `query_summary` totals. |
+| `data/processed/steam_reviews_all_languages.csv` | Combined dataset with an `app_id` and language column. |
 | `reports/data_dictionary.md` | Column-by-column documentation. |
 | `reports/cleaning_summary.txt` | Counts of dropped/duplicate/non-English rows. |
 | `reports/validation_summary.txt` | Pass/fail QA report with manual spot-check samples. |
@@ -51,11 +51,15 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Run every command from the project root.
 
 ```powershell
-# 0) Confirm the App ID points to the 2024 Delta Force
+# 0) Confirm the configured App ID (Delta Force by default)
 python src/verify_app.py
 
-# 1) Crawl (auto-detects which Steam endpoint this network can use)
+# 1) Crawl both games (auto-detects the endpoint separately per game)
 python src/fetch_reviews.py
+
+# Or crawl only one game
+python src/fetch_reviews.py --game delta-force
+python src/fetch_reviews.py --game battlefield-6
 
 # 2) Build the clean CSV
 python src/clean_reviews.py
@@ -78,22 +82,23 @@ python src/validate_reviews.py
 
 ### 4.1 API mode (preferred)
 
-Steam's public review endpoint returns up to 100 reviews per request:
+Steam's current `IUserReviewsService/GetAppReviews` endpoint returns up to 100
+reviews per request. It replaces the deprecated Store endpoint. The API key is
+optional for public reviews; an app-associated publisher key gets a higher
+rate limit.
 
 ```
-https://store.steampowered.com/appreviews/2507950
-    ?json=1
-    &language=english
-    &filter=recent              # full chronological crawl
-    &review_type=all            # positive + negative
-    &purchase_type=all          # Steam + non-Steam purchases
-    &filter_offtopic_activity=0 # include review-bombed reviews
-    &num_per_page=100
-    &cursor=<cursor>
+https://api.steampowered.com/IUserReviewsService/GetAppReviews/v1/
+    ?key=<optional app-associated publisher key>
+    &input_json={"appid":<app_id>,"filter":1,"languages":["all"],
+                 "review_type":0,"purchase_type":1,
+                 "filter_offtopic_activity":false,
+                 "num_per_page":100,"cursor":"<cursor>"}
 ```
 
 The first cursor is `*`; every response contains the cursor for the next page.
 The crawl stops when Steam returns no reviews or the cursor stops changing.
+The numeric filter values are Steam's `Recent`, `All`, and `All` enums.
 This mode supplies exact timestamps, helpfulness scores, author statistics, and
 the real `recommendationid`.
 
@@ -104,13 +109,13 @@ JSON endpoint to the store home page. When that happens, `--mode auto` switches
 to the public community pages:
 
 ```
-https://steamcommunity.com/app/2507950/reviews/?browsefilter=mostrecent&p=1&filterLanguage=english
+https://steamcommunity.com/app/<app_id>/reviews/?browsefilter=mostrecent&p=1&filterLanguage=all
 ```
 
 Pagination uses the hidden "next page" form, which posts to:
 
 ```
-https://steamcommunity.com/app/2507950/homecontent/?userreviewscursor=...&userreviewsoffset=...
+https://steamcommunity.com/app/<app_id>/homecontent/?userreviewscursor=...&userreviewsoffset=...
 ```
 
 The fallback renders **10 reviews per request**, so it is slower, and a few
@@ -125,14 +130,14 @@ python src/fetch_reviews.py --mode api
 python src/fetch_reviews.py --mode html --reset-state
 ```
 
-If you switch modes mid-project, the old state file must be reset. Raw data is
-never deleted, and the cleaner deduplicates.
+The old API cursor is reset automatically when the scraper detects a state
+created with the deprecated API. Existing raw review IDs remain and are skipped.
 
 ### 4.3 Resume after an interruption
 
-Every page is written to disk and the cursor is checkpointed before the next
-request. `Ctrl+C`, a timeout, or a closed laptop loses at most the page that was
-in flight. Simply rerun the same command.
+Every page is written to disk and that game's cursor is checkpointed before
+the next request. `Ctrl+C`, a timeout, or a closed laptop loses at most the
+page that was in flight. Rerun the same command; existing IDs are skipped.
 
 To start over deliberately:
 
@@ -140,13 +145,17 @@ To start over deliberately:
 python src/fetch_reviews.py --reset-state
 ```
 
-This deletes only `data/state/crawl_state.json`; existing raw rows remain and
-are deduplicated by the cleaner. Delete `data/raw/reviews_raw.jsonl` manually
+This deletes the selected game's checkpoint(s); existing raw rows stay in
+place and their IDs are skipped. Delete `data/raw/reviews_raw.jsonl` manually
 if you want a truly fresh crawl.
 
 ---
 
 ## 5. Politeness and rate limits
+
+The scraper uses Steam's current public review Web API. A key is optional, but
+an app-associated publisher key raises its rate limit. It requests reviews in
+pages of 100 and follows Steam's cursor until there are no more pages.
 
 - One request at a time, with a random 1.0–1.8 s delay.
 - Descriptive `User-Agent` (set `SCRAPE_USER_AGENT` to include your e-mail).
@@ -167,13 +176,21 @@ variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `STEAM_APP_ID` | `2507950` | Game to scrape |
-| `REVIEW_LANGUAGE` | `english` | Steam language filter |
+| `STEAM_GAME` | `delta-force` | Default game (`delta-force` or `battlefield-6`) |
+| `REVIEW_LANGUAGE` | `all` | Steam language filter (`all` collects every language) |
+| `STEAM_API_KEY` | empty | Optional Steamworks publisher key; higher rate limit when associated with the app |
 | `SCRAPE_MIN_DELAY` | `1.0` | Minimum seconds between requests |
 | `SCRAPE_MAX_DELAY` | `1.8` | Maximum seconds between requests |
 | `SCRAPE_MAX_RETRIES` | `5` | Retries per request |
 | `SCRAPE_MAX_PAGES` | `0` | Page cap (`0` = no cap) |
 | `SCRAPE_USER_AGENT` | academic project string | HTTP User-Agent |
+
+Set the key in the shell before running the crawler. In PowerShell:
+
+```powershell
+$env:STEAM_API_KEY = "your-key"
+python src/fetch_reviews.py
+```
 
 ---
 
@@ -186,7 +203,7 @@ variables:
 2. Drop records without a review ID.
 3. Deduplicate review IDs (keep the most recently scraped copy).
 4. Deduplicate identical text by the same author.
-5. Keep only `language == english`.
+5. Keep reviews in every language (the API supplies a language label; HTML fallback may use `unknown`).
 6. Drop reviews with fewer than 3 characters of text.
 7. Strip Steam BBCode/HTML into `review_clean` (the raw text is preserved).
 8. Convert timestamps to UTC, playtime to hours, votes to integers.
@@ -210,7 +227,7 @@ possibly mis-tagged reviews, not to delete them automatically.
 
 - All expected columns exist and the dataset is not empty.
 - `review_id` is unique.
-- Every row is English and belongs to App ID 2507950.
+- Every row is English and belongs to App ID 2507950 or 2807960.
 - Required fields are present; dates are parseable and inside the game's
   lifetime.
 - No duplicate author+text pairs.
@@ -259,8 +276,8 @@ Proyek UAS/
 ## 11. Definition of done
 
 - [ ] `verify_app.py` confirms the App ID and shows the expected game.
-- [ ] Full crawl completes; `crawl_state.json` has `"finished": true`.
-- [ ] `delta_force_reviews_english.csv` exists and all rows are English.
+- [ ] Full crawls complete; each game's `crawl_state_<app_id>.json` has `"finished": true`.
+- [ ] `steam_reviews_all_languages.csv` exists and includes both app IDs.
 - [ ] `validation_summary.txt` reports **PASS** (warnings explained).
 - [ ] Crawl date, row count, mode (`api`/`html`), and API parameters are
       recorded for the report.
