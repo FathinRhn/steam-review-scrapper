@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Project data (keep the code, not the crawl artifacts)
+data/raw/*.jsonl
+data/state/*.json
+data/processed/*.csv
+reports/*.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
